@@ -1,0 +1,52 @@
+{
+  "name": "desk",
+  "productName": "Desk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A quiet desk window for reviewing postgraduate English vocabulary.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win dir"
+  },
+  "dependencies": {
+    "electron": "33.4.11"
+  },
+  "build": {
+    "appId": "local.desk.vocabulary",
+    "productName": "Desk",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "index.html",
+      "styles.css",
+      "srs.js",
+      "icon.png",
+      "data/deck.js"
+    ],
+    "extraResources": [
+      {
+        "from": "data/vocab-a.txt",
+        "to": "data/vocab-a.txt"
+      },
+      {
+        "from": "data/vocab-b.txt",
+        "to": "data/vocab-b.txt"
+      },
+      {
+        "from": "data/decks.txt",
+        "to": "data/decks.txt"
+      }
+    ],
+    "win": {
+      "target": "dir",
+      "icon": "icon.png",
+      "signAndEditExecutable": false
+    }
+  }
+}
