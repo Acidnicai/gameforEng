@@ -84,7 +84,31 @@ function schedule(card, rating, now) {
     return c
   }
 
+  // 5 is the "already known" grade. The caller only applies it after a correct spelling.
+  if (rating === 5) {
+    c.ease = clampEase(c.ease + 0.15)
+    if (c.reps < 3) c.reps = 3
+    c.intervalDays = roundDays(Math.max(21, (c.intervalDays || 0) * 2))
+    c.due = now + c.intervalDays * DAY
+    return c
+  }
+
   throw new Error('bad rating')
+}
+
+function normalizeAnswer(text) {
+  return String(text || '')
+    .normalize('NFKC')
+    .trim()
+    .replace(/[’‘]/g, "'")
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+}
+
+function answersMatch(expected, typed) {
+  const answer = normalizeAnswer(expected)
+  if (!answer) return false
+  return answer === normalizeAnswer(typed)
 }
 
 function applyRating(card, rating, now, queueLength) {
@@ -104,7 +128,7 @@ function humanizeGap(ms) {
 function previewsFor(card, now, queueLength) {
   const base = card || freshCard()
   const out = {}
-  for (const rating of [1, 2, 3, 4]) {
+  for (const rating of [1, 2, 3, 4, 5]) {
     const next = applyRating(base, rating, now, queueLength)
     out[String(rating)] = humanizeGap(next.due - now)
   }
@@ -118,5 +142,6 @@ module.exports = {
   schedule,
   applyRating,
   humanizeGap,
-  previewsFor
+  previewsFor,
+  answersMatch
 }

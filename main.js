@@ -3,11 +3,11 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen } = require('electron')
 const path = require('path')
 const fs = require('fs')
-const { POS, freshCard, applyRating, previewsFor } = require('./srs')
+const { POS, freshCard, applyRating, previewsFor, answersMatch } = require('./srs')
 const { loadFrom } = require('./data/deck')
 
 // Windows paints a black rectangle behind a transparent window when the GPU
-// compositor is on. The plant has to sit on the desktop, so leave that off.
+// compositor is on. The pet has to sit on the desktop, so leave that off.
 if (process.platform === 'win32') app.disableHardwareAcceleration()
 
 // Review keys stay inside this window. Do not register a global shortcut.
@@ -24,7 +24,10 @@ let dataDir = path.join(ROOT, 'data')
 let words = []
 let byId = new Map()
 let session = []
+let firstLook = new Set()
 let revealedId = null
+let pendingSpell = new Map()
+let spellTries = new Map()
 let boundsTimer = null
 let petMode = false
 
@@ -45,11 +48,33 @@ function validBounds(bounds) {
   return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }
 }
 
-function cleanSenses(list) {
+function cleanSenses(list, leftover) {
   if (!Array.isArray(list)) return []
-  return list
+  const senses = list
     .filter((sense) => sense && sense.pos && sense.zh)
-    .map((sense) => ({ pos: String(sense.pos), zh: String(sense.zh) }))
+    .map((sense) => ({
+      pos: String(sense.pos),
+      zh: String(sense.zh),
+      sentences: cleanSentences(sense.sentences).slice(0, 4)
+    }))
+  const extra = cleanSentences(leftover)
+  if (extra.length && senses.length && !senses.some((sense) => sense.sentences.length)) {
+    senses[0].sentences = extra.slice(0, 4)
+  }
+  return senses
+}
+
+function cleanSentences(list) {
+  if (!Array.isArray(list)) return []
+  const out = []
+  list.forEach((item) => {
+    if (!item) return
+    const en = String(item.en || '').trim()
+    const zh = String(item.zh || '').trim()
+    if (!en) return
+    out.push({ en: en.slice(0, 240), zh: zh.slice(0, 240) })
+  })
+  return out.slice(0, 8)
 }
 
 function cleanCustom(list, blocked) {
@@ -61,7 +86,7 @@ function cleanCustom(list, blocked) {
     const word = item.word.trim().replace(/\s+/g, ' ')
     const id = String(item.id || word).trim().toLowerCase()
     if (!word || !id || seen.has(id) || blocked.has(id)) return
-    const senses = cleanSenses(item.senses)
+    const senses = cleanSenses(item.senses, item.sentences)
     if (!senses.length) return
     seen.add(id)
     out.push({
@@ -132,14 +157,21 @@ function hiddenSet() {
 }
 
 function applyOverride(word) {
+  const base = {
+    id: word.id,
+    word: word.word,
+    phonetic: word.phonetic,
+    senses: cleanSenses(word.senses),
+    custom: false
+  }
   const over = progress.overrides && progress.overrides[word.id]
-  const senses = cleanSenses(over && over.senses)
-  if (!senses.length) return { ...word, custom: false }
+  if (!over) return base
+  const senses = cleanSenses(over.senses, over.sentences)
   return {
     id: word.id,
     word: over.word ? String(over.word) : word.word,
     phonetic: over.phonetic != null ? String(over.phonetic) : word.phonetic,
-    senses,
+    senses: senses.length ? senses : cleanSenses(word.senses),
     custom: false
   }
 }
@@ -160,11 +192,6 @@ function indexWords() {
 }
 
 function buildSession(now) {
-  const today = dayKey(now)
-  let introducedToday = 0
-  Object.values(progress.cards).forEach((card) => {
-    if (card && card.introducedOn === today) introducedToday += 1
-  })
   const due = []
   const unseen = []
   words.forEach((word) => {
@@ -176,8 +203,9 @@ function buildSession(now) {
     if (typeof card.due === 'number' && card.due <= now) due.push({ id: word.id, due: card.due })
   })
   due.sort((a, b) => a.due - b.due)
-  const slots = Math.max(0, progress.settings.dailyNew - introducedToday)
-  return due.map((item) => item.id).concat(unseen.slice(0, slots))
+  const queue = due.map((item) => item.id).concat(unseen)
+  firstLook = new Set(queue)
+  return queue
 }
 
 function countIntroducedToday(now) {
@@ -215,21 +243,87 @@ function view() {
 
 function publicCard(includeSenses) {
   while (session.length) {
-    const word = byId.get(session[0])
-    if (word) {
-      const card = {
+    const id = session[0]
+    const word = byId.get(id)
+    if (!word) {
+      pendingSpell.delete(id)
+      spellTries.delete(id)
+      firstLook.delete(id)
+      session.shift()
+      continue
+    }
+    if (pendingSpell.has(id)) {
+      return {
         id: word.id,
-        word: word.word,
-        phonetic: word.phonetic,
-        senseCount: word.senses.length,
+        spell: true,
+        grade: pendingSpell.get(id),
+        label: word.senses[0] ? word.senses[0].zh : '',
+        senses: word.senses,
         custom: !!word.custom
       }
-      if (includeSenses) card.senses = word.senses
-      return card
     }
-    session.shift()
+    const card = {
+      id: word.id,
+      word: word.word,
+      phonetic: word.phonetic,
+      senseCount: word.senses.length,
+      custom: !!word.custom
+    }
+    if (includeSenses) card.senses = word.senses
+    return card
   }
   return null
+}
+
+function reinsertSoon(id) {
+  firstLook.delete(id)
+  let at = 0
+  while (at < session.length && firstLook.has(session[at])) at += 1
+  if (at === 0) {
+    session.push(id)
+    return
+  }
+  let seen = 0
+  while (at < session.length && seen < 3) {
+    at += 1
+    seen += 1
+  }
+  session.splice(at, 0, id)
+}
+
+function commitRating(id, rating) {
+  if (![1, 2, 3, 4, 5].includes(rating)) return { ok: false, error: '先显示释义' }
+  if (revealedId !== id || !session.length || session[0] !== id) return { ok: false, error: '先显示释义' }
+  const now = Date.now()
+  const prev = progress.cards[id] || freshCard()
+  const queueLength = session.length
+  const next = applyRating(prev, rating, now, queueLength)
+  next.introducedOn = prev.introducedOn || dayKey(now)
+  progress.cards[id] = next
+  saveProgress()
+  session.shift()
+  firstLook.delete(id)
+  revealedId = null
+  if ((rating === 1 || rating === 2) && queueLength > 1) reinsertSoon(id)
+  else if (!session.includes(id)) armSoon(id, next.due)
+  return payload()
+}
+
+function queueSpell(id, rating) {
+  pendingSpell.set(id, rating)
+  spellTries.delete(id)
+  session.shift()
+  revealedId = null
+  reinsertSoon(id)
+  return payload()
+}
+
+function deferSpell(id) {
+  spellTries.delete(id)
+  session.shift()
+  revealedId = null
+  reinsertSoon(id)
+  return payload()
 }
 
 function payload(extra) {
@@ -292,15 +386,29 @@ function defaultBounds() {
   }
 }
 
+const PET_W = 128
+const PET_H = 158
+
 function defaultPetBounds() {
   const area = screen.getPrimaryDisplay().workArea
-  const width = 168
-  const height = 210
   return {
-    x: Math.max(area.x, area.x + area.width - width - 24),
-    y: Math.max(area.y, area.y + area.height - height - 24),
-    width,
-    height
+    x: Math.max(area.x, area.x + area.width - PET_W - 16),
+    y: Math.max(area.y, area.y + area.height - PET_H - 16),
+    width: PET_W,
+    height: PET_H
+  }
+}
+
+function petBox(bounds) {
+  const area = screen.getPrimaryDisplay().workArea
+  const box = boundsOnScreen(bounds)
+  const x = box ? box.x + box.width - PET_W : area.x + area.width - PET_W - 16
+  const y = box ? box.y + box.height - PET_H : area.y + area.height - PET_H - 16
+  return {
+    x: Math.max(area.x, Math.min(x, area.x + area.width - PET_W)),
+    y: Math.max(area.y, Math.min(y, area.y + area.height - PET_H)),
+    width: PET_W,
+    height: PET_H
   }
 }
 
@@ -314,11 +422,12 @@ function showWin() {
 function applyChrome() {
   if (!win || win.isDestroyed()) return
   if (petMode) {
-    const box = boundsOnScreen(progress.settings.petBounds) || defaultPetBounds()
+    const box = petBox(progress.settings.petBounds)
     win.setResizable(true)
-    win.setMinimumSize(140, 180)
-    win.setMaximumSize(220, 260)
+    win.setMinimumSize(PET_W, PET_H)
+    win.setMaximumSize(PET_W, PET_H)
     win.setBounds(box)
+    win.setBackgroundColor('#00000000')
     win.setResizable(false)
     win.setSkipTaskbar(true)
     win.setAlwaysOnTop(true, 'floating')
@@ -400,23 +509,24 @@ function createTray() {
 function createWindow() {
   petMode = !!progress.settings.pet
   const initial = petMode
-    ? (boundsOnScreen(progress.settings.petBounds) || defaultPetBounds())
+    ? petBox(progress.settings.petBounds)
     : (boundsOnScreen(progress.settings.bounds) || defaultBounds())
   win = new BrowserWindow({
     x: initial.x,
     y: initial.y,
     width: initial.width,
     height: initial.height,
-    minWidth: petMode ? 140 : 360,
-    minHeight: petMode ? 180 : 520,
-    maxWidth: petMode ? 220 : undefined,
-    maxHeight: petMode ? 260 : undefined,
+    minWidth: petMode ? PET_W : 360,
+    minHeight: petMode ? PET_H : 520,
+    maxWidth: petMode ? PET_W : undefined,
+    maxHeight: petMode ? PET_H : undefined,
     resizable: !petMode,
     show: false,
     frame: false,
     thickFrame: false,
     roundedCorners: false,
     transparent: true,
+    backgroundColor: '#00000000',
     hasShadow: false,
     skipTaskbar: petMode,
     title: 'Desk',
@@ -455,6 +565,7 @@ function topUp(limit) {
     if (added >= limit) break
     if (inSession.has(word.id) || progress.cards[word.id]) continue
     session.push(word.id)
+    firstLook.add(word.id)
     inSession.add(word.id)
     added += 1
   }
@@ -475,14 +586,31 @@ function readEntry(source) {
     if (!zh) continue
     if (!POS.includes(pos)) return { error: '词性要用 n. / v. / adj. 这类标记' }
     if (zh.length > 80) return { error: '一条释义请短一点' }
-    senses.push({ pos, zh })
+    const sentences = []
+    for (const line of (row && row.sentences) || []) {
+      const en = String((line && line.en) || '').trim()
+      const cn = String((line && line.zh) || '').trim()
+      if (!en && !cn) continue
+      if (!en) return { error: '句子要有英文' }
+      if (en.length > 240 || cn.length > 240) return { error: '句子太长了' }
+      sentences.push({ en, zh: cn })
+    }
+    if (sentences.length > 4) return { error: '一条词义的句子太多了' }
+    senses.push({ pos, zh, sentences })
   }
   if (!senses.length) return { error: '至少写一条中文释义' }
   if (senses.length > 12) return { error: '释义太多了' }
+  const loose = cleanSentences(source.sentences)
+  if (loose.length && !senses.some((sense) => sense.sentences.length)) senses[0].sentences = loose.slice(0, 4)
   return { word, phonetic, senses }
 }
 
 function resolveDataDir() {
+  if (!app.isPackaged && process.env.DESK_DATA) {
+    const dir = path.resolve(process.env.DESK_DATA)
+    fs.mkdirSync(dir, { recursive: true })
+    return dir
+  }
   if (!app.isPackaged) return path.join(ROOT, 'data')
   const beside = path.join(path.dirname(process.execPath), 'data')
   fs.mkdirSync(beside, { recursive: true })
@@ -527,23 +655,64 @@ ipcMain.handle('desk:word', (_event, id) => {
 })
 
 ipcMain.handle('desk:rate', (_event, id, rating) => {
-  if (![1, 2, 3, 4].includes(rating)) return { ok: false, error: '先显示释义' }
+  if (pendingSpell.has(id)) return { ok: false, error: '先把这个词写出来' }
+  if (![1, 2].includes(rating)) return { ok: false, error: '这个档要先写出来' }
+  return commitRating(id, rating)
+})
+
+ipcMain.handle('desk:mark', (_event, id, rating) => {
+  if (![3, 4, 5].includes(rating)) return { ok: false, error: '先显示释义' }
+  if (pendingSpell.has(id)) return { ok: false, error: '这个词已经在等默写' }
   if (revealedId !== id || !session.length || session[0] !== id) return { ok: false, error: '先显示释义' }
-  const now = Date.now()
-  const prev = progress.cards[id] || freshCard()
-  const queueLength = session.length
-  const next = applyRating(prev, rating, now, queueLength)
-  next.introducedOn = prev.introducedOn || dayKey(now)
-  progress.cards[id] = next
-  saveProgress()
-  session.shift()
-  revealedId = null
-  if (rating === 1 && queueLength > 1) {
-    session.splice(Math.min(3, session.length), 0, id)
-  } else if (!session.includes(id)) {
-    armSoon(id, next.due)
+  return queueSpell(id, rating)
+})
+
+ipcMain.handle('desk:spell', (_event, id, typed) => {
+  if (!pendingSpell.has(id) || !session.length || session[0] !== id) return { ok: false, error: '现在不用写' }
+  const word = byId.get(id)
+  if (!word) return { ok: false, error: '没有这个词' }
+  const rating = pendingSpell.get(id)
+  if (answersMatch(word.word, typed)) {
+    pendingSpell.delete(id)
+    spellTries.delete(id)
+    revealedId = id
+    const result = commitRating(id, rating)
+    result.match = true
+    return result
   }
-  return payload()
+  const tries = (spellTries.get(id) || 0) + 1
+  spellTries.set(id, tries)
+  if (tries < 2) return { ok: true, match: false, retry: true }
+  const result = deferSpell(id)
+  result.match = false
+  result.later = true
+  return result
+})
+
+ipcMain.handle('desk:browse', () => {
+  return {
+    ok: true,
+    words: words.map((word) => ({
+      id: word.id,
+      word: word.word,
+      phonetic: word.phonetic || '',
+      senses: word.senses
+    }))
+  }
+})
+
+ipcMain.handle('desk:cancel-spell', (_event, id) => {
+  if (!pendingSpell.has(id) || !session.length || session[0] !== id) return { ok: false }
+  const word = byId.get(id)
+  if (!word) return { ok: false, error: '没有这个词' }
+  pendingSpell.delete(id)
+  spellTries.delete(id)
+  revealedId = id
+  const card = progress.cards[id] || freshCard()
+  return Object.assign(payload(), {
+    senses: word.senses,
+    previews: previewsFor(card, Date.now(), session.length)
+  })
 })
 
 ipcMain.handle('desk:add-word', (_event, input) => {
@@ -563,6 +732,7 @@ ipcMain.handle('desk:add-word', (_event, input) => {
   session = session.filter((item) => item !== id)
   const at = session.length ? 1 : 0
   session.splice(at, 0, id)
+  firstLook.add(id)
   return payload({ queuedNext: at === 1 })
 })
 
@@ -579,6 +749,7 @@ ipcMain.handle('desk:update-word', (_event, input) => {
     item.word = entry.word
     item.phonetic = entry.phonetic
     item.senses = entry.senses
+    delete item.sentences
   } else {
     progress.overrides[id] = {
       word: entry.word,
@@ -602,9 +773,12 @@ ipcMain.handle('desk:delete-word', (_event, id) => {
     progress.hidden.push(id)
   }
   if (progress.overrides) delete progress.overrides[id]
+  pendingSpell.delete(id)
+  spellTries.delete(id)
   saveProgress()
   indexWords()
   session = session.filter((item) => item !== id)
+  firstLook.delete(id)
   if (revealedId === id) revealedId = null
   return payload()
 })
@@ -627,7 +801,7 @@ ipcMain.handle('desk:daily-new', (_event, n) => {
 })
 
 ipcMain.handle('desk:more-new', () => {
-  const added = topUp(10)
+  const added = topUp(words.length)
   revealedId = null
   return payload({ added })
 })
