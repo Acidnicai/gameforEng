@@ -3,7 +3,7 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen } = require('electron')
 const path = require('path')
 const fs = require('fs')
-const { POS, freshCard, applyRating, previewsFor, answersMatch } = require('./srs')
+const { POS, POS_LABEL, freshCard, applyRating, previewsFor, answersMatch } = require('./srs')
 const { loadFrom } = require('./data/deck')
 
 // Windows paints a black rectangle behind a transparent window when the GPU
@@ -40,6 +40,14 @@ function dayKey(now) {
   const month = String(d.getMonth() + 1).padStart(2, '0')
   const day = String(d.getDate()).padStart(2, '0')
   return d.getFullYear() + '-' + month + '-' + day
+}
+
+function validDay(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return ''
+  const [y, m, d] = value.split('-').map(Number)
+  const dt = new Date(y, m - 1, d)
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return ''
+  return value
 }
 
 function validBounds(bounds) {
@@ -89,12 +97,14 @@ function cleanCustom(list, blocked) {
     const senses = cleanSenses(item.senses, item.sentences)
     if (!senses.length) return
     seen.add(id)
+    const addedOn = validDay(item.addedOn)
     out.push({
       id,
       word,
       phonetic: String(item.phonetic || ''),
       senses,
-      custom: true
+      custom: true,
+      addedOn
     })
   })
   return out
@@ -125,6 +135,17 @@ function normalizeProgress(data) {
   next.customWords = Array.isArray(data.customWords) ? data.customWords : []
   next.hidden = Array.isArray(data.hidden) ? data.hidden.filter((id) => typeof id === 'string' && id) : []
   if (data.overrides && typeof data.overrides === 'object') next.overrides = data.overrides
+  next.addedOn = {}
+  if (data.addedOn && typeof data.addedOn === 'object' && !Array.isArray(data.addedOn)) {
+    Object.entries(data.addedOn).forEach(([id, day]) => {
+      const kept = validDay(day)
+      if (id && kept) next.addedOn[id] = kept
+    })
+  }
+  next.addedReady = !!data.addedReady
+  next.addedSeen = Array.isArray(data.addedSeen)
+    ? data.addedSeen.filter((id) => typeof id === 'string' && id)
+    : []
   return next
 }
 
@@ -189,6 +210,34 @@ function indexWords() {
   progress.customWords = custom
   words = base.concat(custom)
   byId = new Map(words.map((word) => [word.id, word]))
+  stampAddedDates()
+}
+
+function introducedDay(id) {
+  const card = progress.cards && progress.cards[id]
+  return card ? validDay(card.introducedOn) : ''
+}
+
+function stampAddedDates() {
+  if (!progress.addedOn || typeof progress.addedOn !== 'object') progress.addedOn = {}
+  if (!Array.isArray(progress.addedSeen)) progress.addedSeen = []
+  const seen = new Set(progress.addedSeen)
+  const first = !progress.addedReady
+  const today = dayKey(Date.now())
+  words.forEach((word) => {
+    const known = first || seen.has(word.id)
+    let date = word.custom ? validDay(word.addedOn) : validDay(progress.addedOn[word.id])
+    if (!date && first) date = introducedDay(word.id)
+    if (!date && (word.custom || !known)) date = today
+    word.addedOn = date || ''
+    if (word.custom) {
+      const item = progress.customWords.find((entry) => entry.id === word.id)
+      if (item) item.addedOn = word.addedOn
+    } else if (date) progress.addedOn[word.id] = date
+    seen.add(word.id)
+  })
+  progress.addedSeen = Array.from(seen)
+  progress.addedReady = true
 }
 
 function buildSession(now) {
@@ -237,7 +286,8 @@ function view() {
     deckSize: words.length,
     alwaysOnTop: !!progress.settings.alwaysOnTop,
     pet: petMode,
-    pos: POS
+    pos: POS,
+    posLabel: POS_LABEL
   }
 }
 
@@ -583,7 +633,12 @@ function readEntry(source) {
   for (const row of source.senses || []) {
     const pos = String(row.pos || '').trim()
     const zh = String(row.zh || '').trim()
-    if (!zh) continue
+    const pendingLines = (row && row.sentences) || []
+    const wroteSentence = pendingLines.some((line) => String((line && line.en) || '').trim() || String((line && line.zh) || '').trim())
+    if (!zh) {
+      if (wroteSentence) return { error: '写了例句的那一条也要有中文释义' }
+      continue
+    }
     if (!POS.includes(pos)) return { error: '词性要用 n. / v. / adj. 这类标记' }
     if (zh.length > 80) return { error: '一条释义请短一点' }
     const sentences = []
@@ -696,7 +751,8 @@ ipcMain.handle('desk:browse', () => {
       id: word.id,
       word: word.word,
       phonetic: word.phonetic || '',
-      senses: word.senses
+      senses: word.senses,
+      addedOn: validDay(word.addedOn)
     }))
   }
 })
@@ -725,7 +781,8 @@ ipcMain.handle('desk:add-word', (_event, input) => {
     word: entry.word,
     phonetic: entry.phonetic,
     senses: entry.senses,
-    custom: true
+    custom: true,
+    addedOn: dayKey(Date.now())
   })
   saveProgress()
   indexWords()

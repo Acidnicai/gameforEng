@@ -1,6 +1,21 @@
 'use strict'
 
-const POS = ['n.', 'v.', 'adj.', 'adv.', 'prep.', 'conj.', 'pron.', 'art.', 'num.', 'aux.', 'phrase']
+const POS = ['n.', 'v.', 'vi.', 'vt.', 'adj.', 'adv.', 'prep.', 'conj.', 'pron.', 'art.', 'num.', 'aux.', 'phrase']
+const POS_LABEL = {
+  'n.': '名词',
+  'v.': '动词',
+  'vi.': '不及物动词',
+  'vt.': '及物动词',
+  'adj.': '形容词',
+  'adv.': '副词',
+  'prep.': '介词',
+  'conj.': '连词',
+  'pron.': '代词',
+  'art.': '冠词',
+  'num.': '数词',
+  'aux.': '助动词',
+  phrase: '短语'
+}
 const MIN_EASE = 1.3
 const MAX_EASE = 3
 const DAY = 24 * 60 * 60 * 1000
@@ -137,6 +152,7 @@ function previewsFor(card, now, queueLength) {
 
 module.exports = {
   POS,
+  POS_LABEL,
   DAY,
   freshCard,
   schedule,

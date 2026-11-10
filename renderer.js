@@ -294,6 +294,14 @@ function renderBrowseBar(shown, total) {
   }
 }
 
+function formatAdded(iso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(iso || ''))) return ''
+  const [y, m, d] = iso.split('-').map((n) => Number(n))
+  if (!y || !m || !d) return ''
+  const year = y === new Date().getFullYear() ? '' : y + '年'
+  return '添加于 ' + year + m + '月' + d + '日'
+}
+
 function renderBrowseList(list) {
   if (!list.length) {
     stage.append(el('p', 'rest-copy', browse.query ? '没有符合的词。' : '词库是空的。'))
@@ -309,6 +317,8 @@ function renderBrowseList(list) {
     row.append(head)
     const zh = item.senses && item.senses[0] ? item.senses[0].zh : ''
     if (zh) row.append(el('span', 'row-zh', zh))
+    const added = formatAdded(item.addedOn)
+    if (added) row.append(el('span', 'row-added', added))
     row.addEventListener('click', () => {
       browse.view = 'card'
       browse.index = index
@@ -337,6 +347,8 @@ function renderBrowseCard(list) {
   stage.append(el('p', 'count', '逐词 ' + (index + 1) + ' / ' + list.length))
   stage.append(el('h1', item.word.length > 14 ? 'word long' : 'word', item.word))
   if (item.phonetic) stage.append(el('p', 'phonetic', item.phonetic))
+  const added = formatAdded(item.addedOn)
+  if (added) stage.append(el('p', 'added-on', added))
   stage.append(senseList(item.senses))
   const edge = index === 0 ? '已经是第一个。' : index === list.length - 1 ? '已经是最后一个。' : ''
   stage.append(el('p', 'hint', edge + '左右方向键翻看。'))
@@ -370,6 +382,8 @@ function renderBrowseSentences(list) {
     const block = el('section', 'sentence-card')
     const head = el('div', 'sentence-head')
     head.append(el('h2', null, item.word))
+    const added = formatAdded(item.addedOn)
+    if (added) head.append(el('span', 'row-added', added))
     if (browse.editing) {
       const edit = el('button', 'ghost slim edit-word', '更改 G')
       edit.type = 'button'
@@ -680,6 +694,32 @@ async function leavePet() {
   render()
 }
 
+function blankDraft() {
+  const pos = (state && state.pos) || ['n.', 'v.']
+  return {
+    word: '',
+    phonetic: '',
+    senses: [
+      { pos: pos[0] || 'n.', zh: '', sentences: [] },
+      { pos: pos[1] || 'v.', zh: '', sentences: [] }
+    ]
+  }
+}
+
+function draftDirty() {
+  if (!draft) return false
+  if (String(draft.word || '').trim() || String(draft.phonetic || '').trim()) return true
+  return (draft.senses || []).some((sense) => {
+    if (String(sense.zh || '').trim()) return true
+    return (sense.sentences || []).some((sentence) => String(sentence.en || '').trim() || String(sentence.zh || '').trim())
+  })
+}
+
+function fitField(node) {
+  node.style.height = 'auto'
+  node.style.height = Math.min(node.scrollHeight, 148) + 'px'
+}
+
 function openAdd() {
   if (!state || petActive()) return
   browse = null
@@ -687,17 +727,9 @@ function openAdd() {
   addOpen = true
   editorMode = 'add'
   confirmDelete = false
-  const pos = state.pos || ['n.', 'v.']
-  draft = {
-    word: '',
-    phonetic: '',
-    senses: [
-      { pos: pos[0] || 'n.', zh: '' },
-      { pos: pos[1] || 'v.', zh: '' }
-    ]
-  }
+  draft = blankDraft()
   render()
-  renderEditor(true)
+  renderEditor('word')
 }
 
 async function openEdit() {
@@ -762,41 +794,45 @@ function closeAdd() {
   if (input) input.focus()
 }
 
-function renderEditor(focusWord) {
+function renderEditor(focus) {
   adder.classList.remove('hidden')
   adder.replaceChildren()
   const editing = editorMode === 'edit'
   adder.append(el('h2', null, editing ? '更改这个词' : '添加一个词'))
   const lead = editing
     ? (draft.custom
-      ? '改的是你自己加的词。复习记录还留在原来的词上。'
-      : '改动记在进度里，词表文件不会被改掉。复习记录还留在原来的词上。')
-    : '至少写一条中文释义。词性可以有多条。'
+      ? '改的是你自己加的词。复习记录还留在原来的词上。每条词义可以带自己的例句。'
+      : '改动记在进度里，词表文件不会被改掉。复习记录还留在原来的词上。每条词义可以带自己的例句。')
+    : '至少写一条中文释义。每条词义可以加例句。保存后可以接着写下一条。'
   adder.append(el('p', 'lead', lead))
 
-  adder.append(el('label', null, '英文'))
+  const body = el('div', 'adder-body')
+  body.append(el('label', null, '英文'))
   const wordInput = el('input')
   wordInput.value = draft.word
   wordInput.autocomplete = 'off'
   wordInput.spellcheck = false
   wordInput.addEventListener('input', () => { draft.word = wordInput.value })
-  adder.append(wordInput)
+  body.append(wordInput)
 
-  adder.append(el('label', null, '音标，可以空着'))
+  body.append(el('label', null, '音标，可以空着'))
   const phonInput = el('input')
   phonInput.value = draft.phonetic
   phonInput.autocomplete = 'off'
   phonInput.spellcheck = false
   phonInput.addEventListener('input', () => { draft.phonetic = phonInput.value })
-  adder.append(phonInput)
+  body.append(phonInput)
 
-  adder.append(el('label', null, '词性和释义'))
+  body.append(el('label', null, '词性和释义'))
   const rows = el('div', 'rows')
   draft.senses.forEach((sense, index) => {
+    if (!Array.isArray(sense.sentences)) sense.sentences = []
+    const block = el('div', 'sense-edit')
     const row = el('div', 'row')
     const select = el('select')
     ;(state.pos || []).forEach((pos) => {
-      const option = el('option', null, pos)
+      const name = state.posLabel && state.posLabel[pos]
+      const option = el('option', null, name ? pos + ' ' + name : pos)
       option.value = pos
       if (pos === sense.pos) option.selected = true
       select.append(option)
@@ -808,10 +844,14 @@ function renderEditor(focusWord) {
       select.append(option)
     }
     select.addEventListener('change', () => { draft.senses[index].pos = select.value })
-    const input = el('input')
+    const input = el('textarea')
     input.value = sense.zh
     input.placeholder = '中文释义'
-    input.addEventListener('input', () => { draft.senses[index].zh = input.value })
+    input.dataset.senseZh = String(index)
+    input.addEventListener('input', () => {
+      draft.senses[index].zh = input.value
+      fitField(input)
+    })
     const remove = el('button', 'iconbtn', '×')
     remove.type = 'button'
     remove.title = '去掉这一条'
@@ -821,82 +861,102 @@ function renderEditor(focusWord) {
       renderEditor(false)
     })
     row.append(select, input, remove)
-    rows.append(row)
-    if (editing && browse && browse.editing) {
-      if (!Array.isArray(sense.sentences)) sense.sentences = []
-      sense.sentences.forEach((sentence, sentenceIndex) => {
-        const sentenceRow = el('div', 'sentence-row')
-        const en = el('input')
-        en.value = sentence.en || ''
-        en.placeholder = '这条词义的英文句子'
-        en.addEventListener('input', () => { draft.senses[index].sentences[sentenceIndex].en = en.value })
-        const zh = el('input')
-        zh.value = sentence.zh || ''
-        zh.placeholder = '中文，可以空着'
-        zh.addEventListener('input', () => { draft.senses[index].sentences[sentenceIndex].zh = zh.value })
-        const removeSentence = el('button', 'iconbtn', '×')
-        removeSentence.type = 'button'
-        removeSentence.title = '去掉这一句'
-        removeSentence.addEventListener('click', () => {
-          draft.senses[index].sentences.splice(sentenceIndex, 1)
-          renderEditor(false)
-        })
-        sentenceRow.append(en, zh, removeSentence)
-        rows.append(sentenceRow)
+    block.append(row)
+    sense.sentences.forEach((sentence, sentenceIndex) => {
+      const sentenceRow = el('div', 'sentence-row')
+      const fields = el('div', 'sentence-fields')
+      const en = el('textarea')
+      en.value = sentence.en || ''
+      en.placeholder = '这条词义的英文句子'
+      en.dataset.sense = String(index)
+      en.dataset.sentence = String(sentenceIndex)
+      en.addEventListener('input', () => {
+        draft.senses[index].sentences[sentenceIndex].en = en.value
+        fitField(en)
       })
-      const addSentence = el('button', 'link', '给这条词义加例句')
+      const zh = el('textarea')
+      zh.value = sentence.zh || ''
+      zh.placeholder = '中文，可以空着'
+      zh.addEventListener('input', () => {
+        draft.senses[index].sentences[sentenceIndex].zh = zh.value
+        fitField(zh)
+      })
+      fields.append(en, zh)
+      const removeSentence = el('button', 'iconbtn', '×')
+      removeSentence.type = 'button'
+      removeSentence.title = '去掉这一句'
+      removeSentence.addEventListener('click', () => {
+        draft.senses[index].sentences.splice(sentenceIndex, 1)
+        renderEditor(false)
+      })
+      sentenceRow.append(fields, removeSentence)
+      block.append(sentenceRow)
+    })
+    if (sense.sentences.length < 4) {
+      const addSentence = el('button', 'link add-sentence', '给这条词义加例句')
       addSentence.type = 'button'
       addSentence.addEventListener('click', () => {
         draft.senses[index].sentences.push({ en: '', zh: '' })
-        renderEditor(false)
+        renderEditor({ kind: 'sentence', sense: index, sentence: draft.senses[index].sentences.length - 1 })
       })
-      rows.append(addSentence)
+      block.append(addSentence)
+    } else {
+      block.append(el('p', 'note', '这一条已经有四句'))
     }
+    rows.append(block)
   })
-  adder.append(rows)
+  body.append(rows)
 
   const extra = el('button', 'link', '再加一条释义')
   extra.type = 'button'
   extra.addEventListener('click', () => {
     const pos = (state.pos && state.pos[0]) || 'n.'
     draft.senses.push({ pos, zh: '', sentences: [] })
-    renderEditor(false)
+    renderEditor({ kind: 'sense', sense: draft.senses.length - 1 })
   })
-  adder.append(extra)
+  body.append(extra)
+  adder.append(body)
 
   const err = el('p', 'err', '')
   adder.append(err)
 
   const actions = el('div', 'adder-actions')
-  const cancel = el('button', 'ghost', '取消')
+  const cancel = el('button', 'ghost', editing ? '取消' : '完成')
   cancel.type = 'button'
-  cancel.addEventListener('click', closeAdd)
-  const save = el('button', 'primary', '保存')
+  cancel.addEventListener('click', () => {
+    if (!editing && draftDirty()) saveEditor(err, true)
+    else closeAdd()
+  })
+  const save = el('button', 'primary', editing ? '保存' : '保存并继续')
   save.type = 'button'
-  save.addEventListener('click', () => saveEditor(err))
+  save.addEventListener('click', () => saveEditor(err, false))
   actions.append(cancel, save)
   adder.append(actions)
-  if (focusWord) wordInput.focus()
-  else {
-    const inputs = adder.querySelectorAll('.row input')
-    const last = inputs[inputs.length - 1]
-    if (last) last.focus()
+  body.querySelectorAll('textarea').forEach(fitField)
+  if (focus === true || focus === 'word') wordInput.focus()
+  else if (focus && focus.kind === 'sentence') {
+    const node = body.querySelector('[data-sense="' + focus.sense + '"][data-sentence="' + focus.sentence + '"]')
+    if (node) node.focus()
+  } else if (focus && focus.kind === 'sense') {
+    const node = body.querySelector('[data-sense-zh="' + focus.sense + '"]')
+    if (node) node.focus()
   }
 }
 
-async function saveEditor(err) {
+async function saveEditor(err, done) {
   const editing = editorMode === 'edit'
   const editedId = draft && draft.id
+  const savedWord = String((draft && draft.word) || '').trim()
   const res = editing
     ? await window.desk.updateWord(draft)
     : await window.desk.addWord(draft)
   if (!res || !res.ok) {
     err.textContent = (res && res.error) || '没有保存'
+    err.classList.remove('ok')
     return
   }
   const same = editing && state && state.card && draft.id === state.card.id
   const queuedNext = !!res.queuedNext
-  closeAdd()
   if (same && revealed && res.senses && !(res.card && res.card.spell)) {
     senses = res.senses
     feedback = null
@@ -915,6 +975,18 @@ async function saveEditor(err) {
       if (at >= 0) browse.index = at
     }
   }
+  if (!editing && !done) {
+    draft = blankDraft()
+    render()
+    renderEditor('word')
+    const note = adder.querySelector('.err')
+    if (note) {
+      note.textContent = '已加上「' + savedWord + '」。可以继续写下一条。'
+      note.classList.add('ok')
+    }
+    return
+  }
+  closeAdd()
   render()
 }
 
